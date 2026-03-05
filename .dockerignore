@@ -1,0 +1,8 @@
+Automatizacion_youtubeShorts/.env
+Automatizacion_youtubeShorts/.venv/
+Automatizacion_youtubeShorts/__pycache__/
+Automatizacion_youtubeShorts/*.pyc
+Automatizacion_youtubeShorts/.tmp/
+Automatizacion_youtubeShorts/pipeline.log
+Automatizacion_youtubeShorts/token.json
+Automatizacion_youtubeShorts/credentials.json

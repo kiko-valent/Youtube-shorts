@@ -63,14 +63,29 @@ Pega el contenido de tu `.env` local (el que tienes en tu PC) y guarda con `Ctrl
 
 ## Paso 6: Configurar YouTube OAuth (token.json)
 
-**Opción A (recomendada):** Copia tu `token.json` local a la VPS:
+Hay dos opciones. La Opción B es la recomendada porque no requiere SSH nunca más para re-autenticar.
+
+**Opción A — Primera vez (más rápido):** Copia tu `token.json` local a la VPS:
 
 ```bash
 # Desde tu PC (PowerShell), ejecuta:
 scp C:\Users\kiko\Desktop\codigo_Claude\Automatizacion_youtubeShorts\token.json usuario@IP_VPS:~/Youtube-shorts/Automatizacion_youtubeShorts/
 ```
 
-**Opción B:** Si el token expira, necesitarás re-autenticarte. Esto requiere un navegador, así que hazlo en local y copia el nuevo `token.json`.
+> **IMPORTANTE:** Antes de copiar el token, asegúrate de que fue generado con el bot del pipeline ejecutando `_perform_interactive_auth()` que fuerza `access_type=offline` y `prompt=consent`. Esto garantiza que el `token.json` incluya `refresh_token` y se auto-renueve indefinidamente. Si tu token antiguo no funciona, bórralo y vuelve a autenticarte localmente con `python tools/youtube_short_pipeline.py`.
+
+**Opción B — Re-autenticación sin SSH (para cuando el token expire):**
+
+Una vez el bot esté corriendo en el VPS, usa el comando `/auth` desde Telegram:
+
+1. Envía `/auth` al bot
+2. El bot te manda un enlace de Google — ábrelo en tu móvil o PC
+3. Inicia sesión con tu cuenta de YouTube
+4. Google te muestra un código — cópialo
+5. Pégalo en el chat de Telegram
+6. ¡Listo! El bot guarda el nuevo `token.json` automáticamente
+
+> **Nota sobre OOB redirect:** El bot usa `urn:ietf:wg:oauth:2.0:oob` para el flujo sin navegador. Esto funciona con proyectos de Google Cloud Console configurados como "Aplicación de escritorio" (Desktop app), que es el tipo que usa este proyecto.
 
 ---
 
@@ -81,7 +96,12 @@ source .venv/bin/activate
 python tools/telegram_bot.py
 ```
 
-Si ves `Esperando mensajes...`, funciona. Para con `Ctrl+C`.
+Si ves los logs de inicio y el bot responde en Telegram, funciona. Para con `Ctrl+C`.
+
+**Al arrancar, el bot verifica automáticamente:**
+- Estado del token de YouTube
+- Limpieza de archivos viejos en `.tmp/`
+- Si hay algún problema con el token, te notifica en Telegram para usar `/auth`
 
 ---
 
@@ -139,6 +159,12 @@ Para ver los logs en tiempo real:
 sudo journalctl -u telegram-shorts-bot -f
 ```
 
+También puedes leer el log del pipeline directamente (incluye timestamps y niveles):
+
+```bash
+tail -f ~/Youtube-shorts/Automatizacion_youtubeShorts/pipeline.log
+```
+
 ---
 
 ## Comandos útiles
@@ -146,16 +172,31 @@ sudo journalctl -u telegram-shorts-bot -f
 | Acción | Comando |
 |---|---|
 | Ver estado | `sudo systemctl status telegram-shorts-bot` |
-| Ver logs | `sudo journalctl -u telegram-shorts-bot -f` |
+| Ver logs systemd | `sudo journalctl -u telegram-shorts-bot -f` |
+| Ver log del pipeline | `tail -f pipeline.log` |
 | Reiniciar | `sudo systemctl restart telegram-shorts-bot` |
 | Detener | `sudo systemctl stop telegram-shorts-bot` |
 | Actualizar código | `cd ~/Youtube-shorts && git pull && sudo systemctl restart telegram-shorts-bot` |
+| Re-autenticar YouTube | Enviar `/auth` en Telegram (sin SSH) |
+| Ver estado del sistema | Enviar `/status` en Telegram |
+
+---
+
+## Comandos de Telegram
+
+| Comando | Descripción |
+|---|---|
+| `/start` | Iniciar un nuevo pipeline (URL → imagen → confirmar) |
+| `/auth` | Re-autenticar YouTube OAuth desde el móvil (sin SSH) |
+| `/status` | Ver estado del token de YouTube y espacio en disco |
+| `/cancel` | Cancelar la operación actual |
 
 ---
 
 ## Restricciones / Casos Borde
 
-- **YouTube OAuth**: El `token.json` expira. Si la subida a YouTube falla con error de autenticación, re-genera el token en local y cópialo a la VPS con `scp`.
-- **Espacio en disco**: Los videos se descargan a `.tmp/`. Limpia periódicamente: `rm -rf ~/Youtube-shorts/Automatizacion_youtubeShorts/.tmp/*`
-- **Memoria**: El pipeline usa poca RAM, pero si la VPS tiene <1GB, puede dar problemas con la edición de imagen.
-- **Firewall**: No necesitas abrir puertos extra. El bot de Telegram usa polling (conexiones salientes).
+- **YouTube OAuth expira:** Si la subida falla con error de autenticación, usa `/auth` en Telegram para re-autenticarte sin SSH. Ya no necesitas copiar `token.json` manualmente.
+- **Timeout de polling:** El pipeline espera hasta 20 minutos (40 intentos × 30s) para que Kie.ai genere el video. Ajustable con `KIEAI_MAX_POLL_ATTEMPTS` y `KIEAI_POLL_INTERVAL` en `.env`.
+- **Espacio en disco:** Los videos se eliminan automáticamente después de subirse a YouTube. También se limpian archivos con más de 24h al arrancar el bot. Limpiar manualmente si hace falta: `rm -rf .tmp/*`
+- **Memoria:** El pipeline usa poca RAM en el VPS (Gemini y Kie.ai procesan en la nube). El único paso local intensivo es la descarga del video (~20-50 MB).
+- **Firewall:** No necesitas abrir puertos extra. El bot de Telegram usa polling (conexiones salientes).

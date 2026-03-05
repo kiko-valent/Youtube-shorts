@@ -4,20 +4,29 @@ telegram_bot.py - Bot de Telegram para YouTube Shorts Pipeline
 Controla el pipeline de YouTube Shorts desde Telegram.
 Flujo: /start → URL → Imagen → Confirmar → Ejecutar → Enlace
 
+Comandos disponibles:
+  /start   - Iniciar un nuevo pipeline
+  /auth    - Autenticar YouTube (necesario en VPS/headless)
+  /status  - Ver estado del sistema (token, disco)
+  /cancel  - Cancelar operación actual
+
 Uso:
   python tools/telegram_bot.py
 """
 
 import os
 import sys
+import re
 import asyncio
+import logging
 import threading
 import traceback
 from pathlib import Path
 from dotenv import load_dotenv
 
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
+    Application,
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
@@ -36,13 +45,27 @@ ALLOWED_USER_ID = int(os.getenv("TELEGRAM_ALLOWED_USER_ID", "0"))
 TMP_DIR = PROJECT_ROOT / ".tmp"
 TMP_DIR.mkdir(exist_ok=True)
 
-# Estados de la conversación
+logger = logging.getLogger(__name__)
+
+# Estados de la conversación principal
 WAITING_URL, WAITING_IMAGE, CONFIRM = range(3)
 
-# Importar funciones del pipeline existente
+# Estado para el flujo de autenticación OAuth
+WAITING_AUTH_CODE = 100
+
+# Validación de URL de YouTube
+YOUTUBE_URL_PATTERN = re.compile(
+    r"(https?://)?(www\.)?(youtube\.com/shorts/|youtu\.be/|youtube\.com/watch\?v=)[\w-]{11}"
+)
+
+# Importar funciones del pipeline
 sys.path.insert(0, str(PROJECT_ROOT / "tools"))
 from youtube_short_pipeline import (
     _check_env,
+    _check_token_health,
+    _get_youtube_auth_url,
+    _complete_youtube_auth,
+    _cleanup_old_tmp,
     analyze_video,
     edit_image,
     upload_to_cloudinary,
@@ -71,10 +94,10 @@ async def _send(update_or_chat_id, context, text: str):
         await update_or_chat_id.message.reply_text(text)
 
 
-# ──────────────────────────── HANDLERS ────────────────────────────
+# ──────────────────────────── HANDLERS: PIPELINE ────────────────────────────
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     """Comando /start - Bienvenida e instrucciones."""
     if not _is_allowed(update):
         await update.message.reply_text("⛔ No tienes acceso a este bot.")
@@ -102,11 +125,11 @@ async def receive_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     url = update.message.text.strip()
 
-    # Validación básica
-    if not url.startswith("http"):
+    if not YOUTUBE_URL_PATTERN.match(url):
         await update.message.reply_text(
-            "❌ Eso no parece una URL válida.\n"
-            "Envíame un enlace que empiece por `http`.",
+            "❌ No parece una URL de YouTube válida.\n"
+            "Envíame un enlace de YouTube Shorts, por ejemplo:\n"
+            "`https://youtube.com/shorts/xxxxxxxxxxx`",
             parse_mode="Markdown",
         )
         return WAITING_URL
@@ -126,11 +149,14 @@ async def receive_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_allowed(update):
         return ConversationHandler.END
 
-    # Puede venir como foto comprimida o como documento (sin compresión)
     if update.message.photo:
-        file = await update.message.photo[-1].get_file()  # Mayor resolución
+        file = await update.message.photo[-1].get_file()
         ext = ".jpg"
-    elif update.message.document and update.message.document.mime_type and update.message.document.mime_type.startswith("image/"):
+    elif (
+        update.message.document
+        and update.message.document.mime_type
+        and update.message.document.mime_type.startswith("image/")
+    ):
         file = await update.message.document.get_file()
         original_name = update.message.document.file_name or "image.png"
         ext = Path(original_name).suffix or ".png"
@@ -141,12 +167,10 @@ async def receive_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return WAITING_IMAGE
 
-    # Descargar imagen
     image_path = TMP_DIR / f"telegram_input{ext}"
     await file.download_to_drive(str(image_path))
     context.user_data["image_path"] = str(image_path)
 
-    # Mostrar resumen para confirmación
     url = context.user_data["url"]
     keyboard = ReplyKeyboardMarkup(
         [["✅ Sí, iniciar pipeline", "❌ No, cancelar"]],
@@ -184,6 +208,18 @@ async def confirm_and_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Responde *Sí* o *No*.", parse_mode="Markdown")
         return CONFIRM
 
+    # Verificar token de YouTube antes de lanzar el pipeline
+    token_ok, token_msg = _check_token_health()
+    if not token_ok:
+        await update.message.reply_text(
+            f"❌ *YouTube no autenticado*\n"
+            f"{token_msg}\n\n"
+            "Usa /auth para autenticarte antes de continuar.",
+            parse_mode="Markdown",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return ConversationHandler.END
+
     await update.message.reply_text(
         "🚀 *¡Pipeline iniciado!*\n"
         "Recibirás actualizaciones de cada paso.\n"
@@ -192,13 +228,11 @@ async def confirm_and_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=ReplyKeyboardRemove(),
     )
 
-    # Ejecutar el pipeline en un thread separado para no bloquear el bot
     url = context.user_data["url"]
     image_path = context.user_data["image_path"]
     chat_id = update.effective_chat.id
     bot = context.bot
 
-    # Lanzar en thread
     loop = asyncio.get_event_loop()
     threading.Thread(
         target=_run_pipeline_thread,
@@ -227,7 +261,7 @@ def _run_pipeline_thread(loop, bot, chat_id, url, image_path):
     try:
         _check_env()
 
-        # ── PASO 1 & 2: Paralelo ──
+        # ── PASO 1 & 2: Análisis + Edición en paralelo ──
         send("🔍 *[1/9]* Analizando video con Gemini...")
         send("🎨 *[2/9]* Editando imagen del personaje...")
 
@@ -250,19 +284,33 @@ def _run_pipeline_thread(loop, bot, chat_id, url, image_path):
         image_url = upload_to_cloudinary(edited_image)
         send(f"✅ Imagen subida: `{image_url[:60]}...`")
 
-        # ── PASO 4: Prompt Sora ──
-        send("📝 *[4/9]* Generando prompt para Sora 2...")
-        sora_prompt = generate_sora_prompt(analysis)
-        send(f"✅ Prompt generado ({len(sora_prompt.split())} palabras)")
+        # ── PASO 4 & 8: Sora prompt + Metadata en paralelo ──
+        send("📝 *[4/9]* Generando prompt y metadatos...")
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            future_prompt = pool.submit(generate_sora_prompt, analysis)
+            future_metadata = pool.submit(generate_metadata, analysis)
+
+            sora_prompt = future_prompt.result()
+            metadata = future_metadata.result()
+
+        send(
+            f"✅ Preparación completada\n"
+            f"   • Prompt: {len(sora_prompt.split())} palabras\n"
+            f"   • Título: _{metadata['titulo_final']}_"
+        )
 
         # ── PASO 5: Crear video ──
         send("🎬 *[5/9]* Creando video con Sora 2 (Kie.ai)...")
         task_id = create_video(sora_prompt, image_url)
         send(f"✅ Tarea creada: `{task_id}`")
 
-        # ── PASO 6: Polling ──
-        send("⏳ *[6/9]* Esperando generación de video (máx 20 min)...\nTe avisaré cuando esté listo 🔔")
-        video_url = poll_video(task_id)
+        # ── PASO 6: Polling con actualizaciones de progreso ──
+        send(
+            "⏳ *[6/9]* Esperando generación de video (máx 20 min)...\n"
+            "Recibirás actualizaciones cada ~2.5 min 🔔"
+        )
+        video_url = poll_video(task_id, progress_callback=send)
         send("✅ ¡Video generado correctamente!")
 
         # ── PASO 7: Descargar ──
@@ -270,11 +318,6 @@ def _run_pipeline_thread(loop, bot, chat_id, url, image_path):
         video_path = download_video(video_url)
         size_mb = Path(video_path).stat().st_size / (1024 * 1024)
         send(f"✅ Video descargado ({size_mb:.1f} MB)")
-
-        # ── PASO 8: Metadatos ──
-        send("🤖 *[8/9]* Generando título, descripción y tags virales...")
-        metadata = generate_metadata(analysis)
-        send(f"✅ Título: _{metadata['titulo_final']}_")
 
         # ── PASO 9: YouTube ──
         send("📤 *[9/9]* Subiendo a YouTube...")
@@ -308,7 +351,114 @@ def _run_pipeline_thread(loop, bot, chat_id, url, image_path):
         traceback.print_exc()
 
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ──────────────────────────── HANDLERS: AUTH ────────────────────────────
+
+
+async def auth_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /auth - Inicia el flujo de autenticación OAuth con YouTube."""
+    if not _is_allowed(update):
+        return ConversationHandler.END
+
+    # Verificar si ya está autenticado
+    token_ok, msg = _check_token_health()
+    if token_ok:
+        await update.message.reply_text(
+            f"✅ YouTube ya está autenticado correctamente.\n_{msg}_",
+            parse_mode="Markdown",
+        )
+        return ConversationHandler.END
+
+    try:
+        auth_url, flow = _get_youtube_auth_url()
+        context.user_data["auth_flow"] = flow
+
+        await update.message.reply_text(
+            "🔐 *Autenticación de YouTube*\n"
+            "═══════════════════════════\n\n"
+            "1️⃣ Abre este enlace en tu móvil o PC:\n"
+            f"`{auth_url}`\n\n"
+            "2️⃣ Inicia sesión con tu cuenta de Google\n"
+            "3️⃣ Google te mostrará un *código de autorización* — cópialo\n"
+            "4️⃣ Pégalo aquí como respuesta\n\n"
+            "_(El enlace expira en ~10 minutos)_",
+            parse_mode="Markdown",
+        )
+        return WAITING_AUTH_CODE
+
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Error generando URL de autenticación:\n`{str(e)[:200]}`",
+            parse_mode="Markdown",
+        )
+        return ConversationHandler.END
+
+
+async def auth_receive_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Recibe el código OAuth del usuario y completa la autenticación."""
+    if not _is_allowed(update):
+        return ConversationHandler.END
+
+    code = update.message.text.strip()
+    flow = context.user_data.get("auth_flow")
+
+    if not flow:
+        await update.message.reply_text(
+            "❌ Sesión de autenticación expirada. Usa /auth de nuevo."
+        )
+        return ConversationHandler.END
+
+    await update.message.reply_text("🔄 Verificando código...")
+
+    try:
+        _complete_youtube_auth(flow, code)
+        context.user_data.pop("auth_flow", None)
+        await update.message.reply_text(
+            "✅ *¡Autenticación completada!*\n"
+            "YouTube está ahora autorizado.\n\n"
+            "Usa /start para crear un Short. 🚀",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Código incorrecto o expirado.\n"
+            f"Error: `{str(e)[:200]}`\n\n"
+            "Usa /auth para intentarlo de nuevo.",
+            parse_mode="Markdown",
+        )
+
+    return ConversationHandler.END
+
+
+# ──────────────────────────── HANDLERS: STATUS / CANCEL ────────────────────────────
+
+
+async def status(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+    """Comando /status - Muestra el estado del sistema."""
+    if not _is_allowed(update):
+        return
+
+    token_ok, token_msg = _check_token_health()
+
+    try:
+        tmp_files = [f for f in TMP_DIR.glob("*") if f.is_file()]
+        tmp_size_mb = sum(f.stat().st_size for f in tmp_files) / (1024 * 1024)
+        tmp_count = len(tmp_files)
+    except Exception:
+        tmp_size_mb = 0.0
+        tmp_count = 0
+
+    auth_icon = "✅" if token_ok else "❌"
+    await update.message.reply_text(
+        "📊 *Estado del Sistema*\n"
+        "═══════════════════════════\n\n"
+        f"YouTube Auth: {auth_icon} {token_msg}\n\n"
+        f"Archivos en .tmp/: {tmp_count} ({tmp_size_mb:.1f} MB)\n\n"
+        f"{'Usa /auth si necesitas autenticarte.' if not token_ok else ''}",
+        parse_mode="Markdown",
+    )
+
+
+async def cancel(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     """Comando /cancel - Cancela la operación actual."""
     await update.message.reply_text(
         "❌ Operación cancelada.\nEnvía /start para empezar de nuevo.",
@@ -317,29 +467,70 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+# ──────────────────────────── STARTUP ────────────────────────────
+
+
+async def post_init(app: Application):
+    """Ejecutado al iniciar el bot: health check y limpieza de archivos viejos."""
+    logger.info("Bot iniciado. Verificando estado del sistema...")
+
+    # Limpiar archivos viejos de .tmp/
+    _cleanup_old_tmp()
+
+    # Verificar token de YouTube y notificar al usuario si hay problema
+    token_ok, token_msg = _check_token_health()
+    if not token_ok:
+        logger.warning("YouTube auth requerido: %s", token_msg)
+        try:
+            await app.bot.send_message(
+                chat_id=ALLOWED_USER_ID,
+                text=(
+                    "⚠️ *YouTube Auth requerido*\n"
+                    f"_{token_msg}_\n\n"
+                    "Usa /auth para autenticarte desde el móvil sin necesidad de SSH."
+                ),
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.warning("No se pudo enviar notificación de startup: %s", e)
+    else:
+        logger.info("YouTube token: %s", token_msg)
+
+
 # ──────────────────────────── MAIN ────────────────────────────
 
 
 def main():
     if not TELEGRAM_BOT_TOKEN:
-        print("❌ TELEGRAM_BOT_TOKEN no encontrado en .env")
+        logger.error("TELEGRAM_BOT_TOKEN no encontrado en .env")
         sys.exit(1)
 
     if not ALLOWED_USER_ID:
-        print("❌ TELEGRAM_ALLOWED_USER_ID no encontrado en .env")
+        logger.error("TELEGRAM_ALLOWED_USER_ID no encontrado en .env")
         sys.exit(1)
 
-    print("═" * 50)
-    print("  🤖 YouTube Shorts Pipeline - Telegram Bot")
-    print("═" * 50)
-    print(f"  Usuario autorizado: {ALLOWED_USER_ID}")
-    print("  Esperando mensajes...")
-    print()
+    logger.info("═" * 50)
+    logger.info("  🤖 YouTube Shorts Pipeline - Telegram Bot")
+    logger.info("═" * 50)
+    logger.info("  Usuario autorizado: %d", ALLOWED_USER_ID)
+    logger.info("  Esperando mensajes...")
 
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
 
-    # Conversación principal
-    conv_handler = ConversationHandler(
+    # Conversación de autenticación OAuth (prioridad alta — se añade primero)
+    auth_conv = ConversationHandler(
+        entry_points=[CommandHandler("auth", auth_start)],
+        states={
+            WAITING_AUTH_CODE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, auth_receive_code),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,
+    )
+
+    # Conversación principal del pipeline
+    main_conv = ConversationHandler(
         entry_points=[
             CommandHandler("start", start),
             MessageHandler(
@@ -353,10 +544,7 @@ def main():
             ],
             WAITING_IMAGE: [
                 MessageHandler(filters.PHOTO, receive_image),
-                MessageHandler(
-                    filters.Document.IMAGE,
-                    receive_image,
-                ),
+                MessageHandler(filters.Document.IMAGE, receive_image),
             ],
             CONFIRM: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_and_run),
@@ -368,9 +556,10 @@ def main():
         ],
     )
 
-    app.add_handler(conv_handler)
+    app.add_handler(auth_conv)
+    app.add_handler(main_conv)
+    app.add_handler(CommandHandler("status", status))
 
-    # Ejecutar
     app.run_polling(drop_pending_updates=True)
 
 
