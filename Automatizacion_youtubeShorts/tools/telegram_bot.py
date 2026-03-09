@@ -377,9 +377,10 @@ async def auth_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "═══════════════════════════\n\n"
             "1️⃣ Abre este enlace en tu móvil o PC:\n"
             f"`{auth_url}`\n\n"
-            "2️⃣ Inicia sesión con tu cuenta de Google\n"
-            "3️⃣ Google te mostrará un *código de autorización* — cópialo\n"
-            "4️⃣ Pégalo aquí como respuesta\n\n"
+            "2️⃣ Inicia sesión con tu cuenta de Google y acepta los permisos\n"
+            "3️⃣ El navegador intentará abrir `http://localhost` — esa página *no cargará*, es normal\n"
+            "4️⃣ Copia la URL completa de la barra de dirección (empieza por `http://localhost/?code=...`)\n"
+            "5️⃣ Pégala aquí como respuesta\n\n"
             "_(El enlace expira en ~10 minutos)_",
             parse_mode="Markdown",
         )

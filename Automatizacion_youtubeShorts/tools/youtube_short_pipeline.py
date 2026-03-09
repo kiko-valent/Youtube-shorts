@@ -205,24 +205,35 @@ def _perform_interactive_auth():
 
 def _get_youtube_auth_url() -> tuple[str, object]:
     """
-    Genera la URL de OAuth OOB para autenticación sin navegador (para VPS/Telegram).
+    Genera la URL de OAuth para autenticación sin navegador (para VPS/Telegram).
 
     Devuelve (auth_url, flow). El flow debe pasarse a _complete_youtube_auth()
-    junto con el código que el usuario obtenga al visitar auth_url.
+    junto con el código o la URL completa de redirección que obtenga el usuario.
     """
     creds_data = _build_creds_data()
     creds_path = PROJECT_ROOT / "credentials.json"
     creds_path.write_text(json.dumps(creds_data, indent=2))
 
     flow = InstalledAppFlow.from_client_secrets_file(str(creds_path), YOUTUBE_SCOPES)
-    flow.redirect_uri = "urn:ietf:wg:oauth:2.0:oob"
+    flow.redirect_uri = "http://localhost"
     auth_url, _ = flow.authorization_url(access_type="offline", prompt="consent")
     return auth_url, flow
 
 
 def _complete_youtube_auth(flow, code: str):
-    """Completa el OAuth con el código del usuario y guarda token.json."""
-    flow.fetch_token(code=code.strip())
+    """Completa el OAuth con el código del usuario y guarda token.json.
+
+    Acepta tanto el código suelto como la URL completa de redirección
+    (http://localhost/?code=XXX&...) que el navegador muestra al fallar la carga.
+    """
+    from urllib.parse import urlparse, parse_qs
+    code = code.strip()
+    if code.startswith("http"):
+        parsed = urlparse(code)
+        extracted = parse_qs(parsed.query).get("code", [None])[0]
+        if extracted:
+            code = extracted
+    flow.fetch_token(code=code)
     creds = flow.credentials
     token_path = PROJECT_ROOT / "token.json"
     token_path.write_text(creds.to_json())
