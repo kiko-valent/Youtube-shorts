@@ -24,10 +24,11 @@ import traceback
 from pathlib import Path
 from dotenv import load_dotenv
 
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     Application,
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     MessageHandler,
     ConversationHandler,
@@ -53,10 +54,16 @@ WAITING_URL, WAITING_IMAGE, CONFIRM = range(3)
 # Estado para el flujo de autenticación OAuth
 WAITING_AUTH_CODE = 100
 
-# Validación de URL de YouTube
-YOUTUBE_URL_PATTERN = re.compile(
-    r"(https?://)?(www\.)?(youtube\.com/shorts/|youtu\.be/|youtube\.com/watch\?v=)[\w-]{11}"
+# Extracción robusta de video ID de YouTube (soporta PC, iPhone, youtu.be, etc.)
+YOUTUBE_SHORT_RE = re.compile(
+    r'(?:youtube\.com/shorts/|youtu\.be/|youtube\.com/watch\?v=)([\w-]{11})'
 )
+
+
+def _extract_video_id(url: str) -> str | None:
+    """Extrae el video ID de cualquier formato de URL de YouTube."""
+    m = YOUTUBE_SHORT_RE.search(url)
+    return m.group(1) if m else None
 
 # Importar funciones del pipeline
 sys.path.insert(0, str(PROJECT_ROOT / "tools"))
@@ -75,7 +82,13 @@ from youtube_short_pipeline import (
     download_video,
     generate_metadata,
     upload_to_youtube,
+    save_successful_video,
+    load_successful_examples,
 )
+
+
+# Almacenamiento temporal de datos para feedback (chat_id → datos del pipeline)
+_pending_feedback: dict[int, dict] = {}
 
 
 # ──────────────────────────── HELPERS ────────────────────────────
@@ -125,7 +138,8 @@ async def receive_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     url = update.message.text.strip()
 
-    if not YOUTUBE_URL_PATTERN.match(url):
+    video_id = _extract_video_id(url)
+    if not video_id:
         await update.message.reply_text(
             "❌ No parece una URL de YouTube válida.\n"
             "Envíame un enlace de YouTube Shorts, por ejemplo:\n"
@@ -134,9 +148,10 @@ async def receive_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return WAITING_URL
 
-    context.user_data["url"] = url
+    clean_url = f"https://youtube.com/shorts/{video_id}"
+    context.user_data["url"] = clean_url
     await update.message.reply_text(
-        f"✅ URL recibida:\n`{url}`\n\n"
+        f"✅ URL recibida:\n`{clean_url}`\n\n"
         "🖼️ Ahora envíame la *imagen del personaje*.\n"
         "Puedes enviarla desde la galería del iPhone/Android o desde el PC.",
         parse_mode="Markdown",
@@ -336,6 +351,28 @@ def _run_pipeline_thread(loop, bot, chat_id, url, image_path):
             "Envía /start para crear otro Short 🚀"
         )
 
+        # Guardar datos para feedback y enviar botones de valoración
+        _pending_feedback[chat_id] = {
+            "youtube_url": f"https://youtube.com/shorts/{video_id}",
+            "analysis": analysis,
+            "sora_prompt": sora_prompt,
+            "metadata": metadata,
+        }
+        feedback_keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Fue viral", callback_data="feedback:viral"),
+                InlineKeyboardButton("❌ No funcionó", callback_data="feedback:nope"),
+            ]
+        ])
+        asyncio.run_coroutine_threadsafe(
+            bot.send_message(
+                chat_id=chat_id,
+                text="📊 ¿Cómo funcionó el video? Marca para que el sistema aprenda:",
+                reply_markup=feedback_keyboard,
+            ),
+            loop,
+        ).result(timeout=30)
+
     except Exception as e:
         elapsed = time.time() - start_time
         error_msg = str(e)[:300]
@@ -468,6 +505,69 @@ async def cancel(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+# ──────────────────────────── HANDLERS: FEEDBACK ────────────────────────────
+
+
+async def feedback_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+    """Callback para los botones de feedback tras completar el pipeline."""
+    query = update.callback_query
+    await query.answer()
+
+    if not _is_allowed(update):
+        return
+
+    chat_id = update.effective_chat.id
+    data = _pending_feedback.pop(chat_id, None)
+
+    if query.data == "feedback:viral":
+        if data:
+            try:
+                save_successful_video(
+                    data["youtube_url"],
+                    data["metadata"],
+                    data["analysis"],
+                    data["sora_prompt"],
+                )
+                await query.edit_message_text(
+                    "✅ *¡Guardado como video exitoso!*\n"
+                    "El sistema usará este video como referencia para mejorar los próximos. 🚀",
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                await query.edit_message_text(f"⚠️ Error al guardar feedback: {str(e)[:100]}")
+        else:
+            await query.edit_message_text("⏱️ Datos ya no disponibles (sesión expirada).")
+    else:
+        await query.edit_message_text("👍 Anotado. Seguimos mejorando.")
+
+
+async def historial(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+    """Comando /historial - Muestra los últimos videos marcados como exitosos."""
+    if not _is_allowed(update):
+        return
+
+    videos = load_successful_examples(n=10)
+
+    if not videos:
+        await update.message.reply_text(
+            "📋 *Historial de videos exitosos*\n\n"
+            "No hay videos marcados como virales todavía.\n"
+            "Después de cada pipeline, marca ✅ si el video funcionó bien.",
+            parse_mode="Markdown",
+        )
+        return
+
+    lines = ["📋 *Últimos videos exitosos:*\n"]
+    for i, v in enumerate(reversed(videos), 1):
+        lines.append(
+            f"*{i}.* _{v.get('titulo', 'Sin título')}_\n"
+            f"   🎭 {v.get('tono', 'N/A')} | 📅 {v.get('fecha', 'N/A')}\n"
+            f"   🔗 {v.get('youtube_url', '')}"
+        )
+
+    await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown")
+
+
 # ──────────────────────────── STARTUP ────────────────────────────
 
 
@@ -560,6 +660,8 @@ def main():
     app.add_handler(auth_conv)
     app.add_handler(main_conv)
     app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("historial", historial))
+    app.add_handler(CallbackQueryHandler(feedback_callback, pattern="^feedback:"))
 
     app.run_polling(drop_pending_updates=True)
 

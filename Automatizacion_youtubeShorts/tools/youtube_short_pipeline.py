@@ -83,6 +83,8 @@ MAX_POLL_ATTEMPTS = int(os.getenv("KIEAI_MAX_POLL_ATTEMPTS", "40"))
 POLL_INTERVAL = int(os.getenv("KIEAI_POLL_INTERVAL", "30"))
 SORA_MAX_WORDS = 300
 TMP_DIR = PROJECT_ROOT / ".tmp"
+DATA_DIR = PROJECT_ROOT / "data"
+FEEDBACK_FILE = DATA_DIR / "successful_videos.json"
 YOUTUBE_SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 YOUTUBE_URL_PATTERN = re.compile(
     r"(https?://)?(www\.)?(youtube\.com/shorts/|youtu\.be/|youtube\.com/watch\?v=)[\w-]{11}"
@@ -258,6 +260,42 @@ def _cleanup_old_tmp(max_age_hours: int = 24):
         logger.info("🧹 Limpieza .tmp/: %d archivos eliminados", deleted)
 
 
+def load_successful_examples(n: int = 3) -> list[dict]:
+    """Carga los últimos N videos marcados como exitosos para usar como few-shot."""
+    if not FEEDBACK_FILE.exists():
+        return []
+    try:
+        with open(FEEDBACK_FILE, encoding="utf-8") as f:
+            videos = json.load(f)
+        return videos[-n:] if videos else []
+    except Exception:
+        return []
+
+
+def save_successful_video(youtube_url: str, metadata: dict, analysis: dict, sora_prompt: str):
+    """Guarda un video exitoso en el archivo de feedback para aprendizaje futuro."""
+    DATA_DIR.mkdir(exist_ok=True)
+    videos = []
+    if FEEDBACK_FILE.exists():
+        try:
+            with open(FEEDBACK_FILE, encoding="utf-8") as f:
+                videos = json.load(f)
+        except Exception:
+            videos = []
+    videos.append({
+        "fecha": datetime.now().strftime("%Y-%m-%d"),
+        "youtube_url": youtube_url,
+        "titulo": metadata.get("titulo_final", ""),
+        "tono": analysis.get("tono_detectado", ""),
+        "razon_viral": analysis.get("razon_viral", ""),
+        "sora_prompt": sora_prompt,
+        "transcripcion": analysis.get("transcripcion", ""),
+    })
+    with open(FEEDBACK_FILE, "w", encoding="utf-8") as f:
+        json.dump(videos, f, ensure_ascii=False, indent=2)
+    logger.info("💾 Video exitoso guardado en feedback (%d total)", len(videos))
+
+
 # ═══════════════════════════ PIPELINE STEPS ═══════════════════════════
 
 
@@ -330,13 +368,23 @@ def edit_image(image_path: str) -> bytes:
     }.get(ext, "image/png")
 
     prompt = (
-        f"Clean this image by removing ALL text, subtitles, watermarks, logos "
-        f"and any visual artifacts. Keep the exact same child figure, pose, "
-        f"clothing, props and background. Only make these small changes: "
-        f"slightly modify the facial features to look like a different child, "
-        f"and change the hair color to {hair_color}. Maintain the same "
-        f"high-quality 3D animation style. The result must be a clean image "
-        f"with no text whatsoever."
+        f"This image may be a screenshot taken from a mobile phone (iPhone or Android) "
+        f"showing a YouTube video. Clean this image completely by removing ALL of: "
+        f"(1) ALL text, subtitles, captions, and dialogue overlaid on the image. "
+        f"(2) ALL watermarks, logos, and brand overlays. "
+        f"(3) Mobile phone UI elements: status bar showing time, battery icon, "
+        f"signal/WiFi icons, home indicator bar at the bottom of the screen. "
+        f"(4) YouTube app UI overlay elements: like/dislike buttons, subscribe button, "
+        f"share button, comment count, channel name and avatar, video title text, "
+        f"progress/seek bar, any YouTube icons or controls on the sides or bottom. "
+        f"(5) Any arrows, swipe hints, navigation elements, or app chrome. "
+        f"Keep ONLY the core animated character, their pose, clothing, props, "
+        f"and the background scene. "
+        f"Make these small changes: slightly modify the facial features to look "
+        f"like a different child, and change the hair color to {hair_color}. "
+        f"Maintain the same high-quality 3D animation style. "
+        f"The result must be a completely clean image with ONLY the character "
+        f"and background — zero text, zero UI elements, zero buttons, zero overlays."
     )
 
     image_part = types.Part.from_bytes(data=image_bytes, mime_type=mime)
@@ -413,35 +461,68 @@ def upload_to_cloudinary(image_bytes: bytes) -> str:
 # ──── PASO 4: Generar prompt para Sora ────
 
 def generate_sora_prompt(analysis: dict) -> str:
-    """Genera un prompt optimizado para Sora 2 basado en la transcripción."""
-    logger.info("📝 [4/9] Generando prompt para Sora 2...")
+    """Usa Claude vía OpenRouter para generar prompt cinematográfico para Sora 2."""
+    logger.info("📝 [4/9] Generando prompt para Sora 2 con Claude...")
 
-    transcript = analysis["transcripcion"]
-    prompt = (
-        f'An animated baby character speaks naturally in a cozy setting. '
-        f'The baby says the following dialogue in Spanish: '
-        f'"{transcript}" '
-        f'The baby has natural expressions and subtle movements. '
-        f'Vertical 9:16 format, 10-15 seconds, cartoon animation style. '
-        f'Family-friendly content.'
+    # Cargar ejemplos exitosos para few-shot learning
+    examples = load_successful_examples(n=3)
+    examples_block = ""
+    if examples:
+        examples_block = "\n\nEXAMPLES OF SUCCESSFUL PROMPTS (learn from these patterns):\n"
+        for ex in examples:
+            examples_block += (
+                f"- Tone: {ex.get('tono', 'N/A')} | "
+                f"Transcript: \"{ex.get('transcripcion', '')[:80]}...\" | "
+                f"Prompt used: \"{ex.get('sora_prompt', '')[:150]}...\"\n"
+            )
+
+    meta_prompt = (
+        "You are an expert animation director specializing in Sora 2 video generation prompts. "
+        "Your prompts create high-quality 3D animated baby character videos for YouTube Shorts.\n\n"
+        "REFERENCE VIDEO ANALYSIS:\n"
+        f"- Hook (first 3 seconds): {analysis['hook_analizado']}\n"
+        f"- Tone: {analysis['tono_detectado']}\n"
+        f"- Narrative structure: {analysis['estructura_narrativa']}\n"
+        f"- Why it's viral: {analysis['razon_viral']}\n"
+        f"- Dialogue/Transcript (in Spanish): {analysis['transcripcion']}\n"
+        f"{examples_block}\n"
+        "Generate a cinematic Sora 2 prompt for a 3D animated baby character video "
+        "that captures the same tone and energy as the reference.\n\n"
+        "RULES:\n"
+        "- Character: a 3D animated baby/toddler (NOT an adult, NOT an older child)\n"
+        f"- The baby says this dialogue in Spanish: \"{analysis['transcripcion']}\"\n"
+        f"- Match the tone precisely: {analysis['tono_detectado']}\n"
+        "- Vertical 9:16 format (YouTube Shorts)\n"
+        "- Duration hint: 10-15 seconds\n"
+        "- Style: high-quality 3D cartoon animation, family-friendly\n"
+        "- Include: setting/background description, facial expressions, "
+        "body movements, lighting, camera angle\n"
+        "- MAX 250 words\n"
+        "- Write ONLY the Sora prompt in English, no explanations or preamble"
     )
 
+    resp = requests.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": "anthropic/claude-3.5-sonnet",
+            "messages": [{"role": "user", "content": meta_prompt}],
+            "temperature": 0.8,
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+
+    prompt = resp.json()["choices"][0]["message"]["content"].strip()
     word_count = len(prompt.split())
-    logger.info("   Palabras: %d/%d", word_count, SORA_MAX_WORDS)
+    logger.info("   ✓ Prompt generado por Claude (%d palabras)", word_count)
 
     if word_count > SORA_MAX_WORDS:
-        max_transcript_words = SORA_MAX_WORDS - 40
-        transcript_words = transcript.split()[:max_transcript_words]
-        transcript = " ".join(transcript_words) + "..."
-        prompt = (
-            f'An animated baby character speaks naturally in a cozy setting. '
-            f'The baby says the following dialogue in Spanish: '
-            f'"{transcript}" '
-            f'The baby has natural expressions and subtle movements. '
-            f'Vertical 9:16 format, 10-15 seconds, cartoon animation style. '
-            f'Family-friendly content.'
-        )
-        logger.warning("   ⚠️  Prompt truncado a %d palabras", len(prompt.split()))
+        prompt = " ".join(prompt.split()[:SORA_MAX_WORDS])
+        logger.warning("   ⚠️  Prompt truncado a %d palabras", SORA_MAX_WORDS)
 
     return prompt
 
@@ -568,39 +649,52 @@ def generate_metadata(analysis: dict) -> dict:
     """Usa OpenRouter (GPT-4o) para generar título, descripción y tags virales."""
     logger.info("🤖 [8/9] Generando metadatos virales con GPT-4o...")
 
+    # Cargar ejemplos exitosos para few-shot learning
+    examples = load_successful_examples(n=3)
+    examples_block = ""
+    if examples:
+        examples_block = "\n<ejemplos_exitosos>\n"
+        for ex in examples:
+            examples_block += (
+                f"- Tono: {ex.get('tono', 'N/A')} | "
+                f"Título que funcionó: \"{ex.get('titulo', '')}\"\n"
+            )
+        examples_block += "</ejemplos_exitosos>\n"
+
     prompt = f"""<role>
-Eres un estratega senior de VIRALIDAD y COMEDIA para YouTube Shorts.
-Tu especialidad es crear títulos y descripciones para videos de "Humor de Bebés".
-Tu tono es divertido, un poco gamberro y muy empático con el caos de los padres.
+Eres un estratega senior de VIRALIDAD para YouTube Shorts.
+Tu especialidad es crear títulos y descripciones virales adaptados al contenido REAL de cada video.
 </role>
 
+<video_analysis>
+- Tono del video: {analysis['tono_detectado']}
+- Hook (apertura): {analysis['hook_analizado']}
+- Por qué es viral: {analysis['razon_viral']}
+- Guion completo: {analysis['transcripcion']}
+</video_analysis>
+{examples_block}
 <instructions>
-TU OBJETIVO:
-Crear metadatos para un video de un "Bebé Adulto/Cínico" (Bebé en traje con micrófono).
-El humor viene del contraste entre la inocencia del bebé y su actitud de adulto estresado.
+Crea metadatos virales basados ÚNICAMENTE en el contenido real del video descrito arriba.
+NO asumas ningún personaje específico ni concepto fijo — el título debe reflejar el tema real del video.
 
 1. TÍTULO (max 80 caracteres):
-- Usa Emojis: 🤣, 💀, 👔, 🎤, 🙈
-- Estructura: [Frase del Bebé] + [Contexto Gracioso]
+- Usa 1-2 emojis relevantes al tema del video
+- Debe generar curiosidad o emoción basándose en el contenido real
+- Estructura: [Idea/frase clave del video] + [Gancho emocional]
 
 2. DESCRIPCIÓN (max 300 caracteres):
-- Chiste corto + contexto + CTA divertido + hashtags
+- Contextualiza el video + CTA divertido + hashtags temáticos
 
 3. TAGS:
-- Mezcla humor + nicho: #funnybaby, #babyboss, #humorviral, #shorts, #comedy
+- 6-8 tags relevantes al tema específico del video + #shorts + #viral
 </instructions>
-
-<input_data>
-- Título Base: {analysis['hook_analizado'][:50]}
-- Guion: {analysis['transcripcion']}
-</input_data>
 
 <output_format>
 Genera SOLO un JSON limpio (sin bloques markdown):
 {{
   "titulo_final": "...",
   "descripcion_completa": "...",
-  "tags": ["funnybaby", "humor", "shorts", "viral", "babyboss", "risas"]
+  "tags": ["tag1", "tag2", "shorts", "viral"]
 }}
 </output_format>"""
 
